@@ -1,0 +1,16 @@
+[package]
+name = "blich-deployer"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+iced = { git = "https://github.com/iced-rs/iced.git", rev = "refs/tags/text-editor", features = ["debug", "image"]}
+tokio = { version = "1.40.0", features = ["fs"] }
+rfd = { version = "0.15.0" }
+solana-cli-config = "^1.18"
+solana-client = "^1.18"
+solana-program = "^1.18"
+solana-rpc-client = "^1.18"
+solana-sdk = "^1.18"
+solana-transaction-status = "^1.18"
