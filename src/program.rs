@@ -1,12 +1,8 @@
-use std::{
-    fs,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-    time::Duration,
+use iced::{futures::future::join_all, Command};
+use solana_client::{
+    nonblocking::rpc_client::RpcClient, rpc_client::SerializableTransaction,
+    rpc_config::RpcSendTransactionConfig,
 };
-
-use iced::Command;
-use solana_client::{nonblocking::rpc_client::RpcClient, rpc_config::RpcSendTransactionConfig};
 use solana_sdk::{
     bpf_loader_upgradeable::{create_buffer, deploy_with_max_program_len, upgrade, write},
     commitment_config::{CommitmentConfig, CommitmentLevel},
@@ -14,16 +10,23 @@ use solana_sdk::{
     instruction::{Instruction, InstructionError},
     message::{v0::Message as TransactionMessage, MessageHeader, VersionedMessage},
     pubkey::Pubkey,
-    signature::Keypair,
+    signature::{Keypair, Signature},
     signer::Signer,
     transaction::{Transaction, TransactionError, VersionedTransaction},
 };
 use solana_transaction_status::UiTransactionEncoding;
-use tokio::time;
+use std::{
+    fs,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use tokio::{spawn, time};
 
 use crate::{errors::Error, BlichDeployer, Message};
 
 const BYTES_PER_CHUNK: usize = 1011;
+const PROGRAM_EXTRA_SPACE: usize = 45;
 
 pub fn create_buffer_account(
     authority: &Keypair,
@@ -53,20 +56,23 @@ pub fn write_data(
     recent_blockhash: Hash,
 ) -> Vec<Transaction> {
     let mut offset = 0;
-
     let mut transactions = Vec::new();
 
-    loop {
-        if offset == program_bytes.len() {
-            break;
-        }
-        let chunk = program_bytes[offset..offset + BYTES_PER_CHUNK].to_vec();
+    while offset < program_bytes.len() {
+        let end = (offset + BYTES_PER_CHUNK).min(program_bytes.len());
+
+        let chunk = program_bytes[offset..end].to_vec();
+
         let write_ix = write(&buffer_address, &authority.pubkey(), offset as u32, chunk);
+
         offset += BYTES_PER_CHUNK;
+
         let mut tx = Transaction::new_with_payer(&[write_ix], Some(&authority.pubkey()));
         tx.sign(&[&authority], recent_blockhash);
-        transactions.push(tx);
+
+        transactions.push(tx)
     }
+
     transactions
 }
 
@@ -91,7 +97,7 @@ pub async fn process_transactions(
     };
 
     let lamports = rpc_client
-        .get_minimum_balance_for_rent_exemption(program_bytes.len() + 45)
+        .get_minimum_balance_for_rent_exemption(program_bytes.len() + PROGRAM_EXTRA_SPACE)
         .await
         .unwrap_or(0);
 
@@ -127,13 +133,81 @@ pub async fn process_transactions(
             if let Some(error) = &confirmation.err {
                 return Err(Error::TransactionError(error.clone()));
             }
-            let is_buff_created = confirmation.satisfies_commitment(CommitmentConfig::finalized());
-            if is_buff_created {
-                break;
-            }
+            let confirm_status = confirmation.confirmation_status();
+            match confirm_status {
+                solana_transaction_status::TransactionConfirmationStatus::Processed => continue,
+                solana_transaction_status::TransactionConfirmationStatus::Confirmed
+                | solana_transaction_status::TransactionConfirmationStatus::Finalized => break,
+                _ => return Err(Error::FetchBalanceError),
+            };
         }
         time::sleep(Duration::from_millis(500)).await
     }
+
+    let blockhash_result2 = rpc_client
+        .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+        .await;
+
+    let updated_blockhash = if let Ok((blockhash_info, _)) = blockhash_result2 {
+        blockhash_info
+    } else {
+        return Err(Error::FetchBlockhashError);
+    };
+
+    let write_data_txs = write_data(
+        &buffer_account.pubkey(),
+        &program_bytes,
+        &authority,
+        updated_blockhash,
+    );
+
+    let mut tx_sent = 0;
+
+    // send all tx
+
+    for transaction in write_data_txs.clone() {
+        tx_sent += 1;
+        let client = rpc_client.clone();
+        let config = send_cfg.clone();
+        let tx = transaction.clone();
+        println!("tx Nº: {}", tx_sent);
+        println!("sending tx: {:?}", transaction.get_signature().to_string());
+        spawn(async move {
+            let _ = client.send_transaction_with_config(&tx, config).await;
+        });
+        time::sleep(Duration::from_millis(25)).await
+    }
+
+
+    // TODO: check tx statuses and retry
+
+    // let tx_signatures: Vec<Signature> = write_data_txs
+    // .clone()
+    // .into_iter()
+    // .map(|tx| *tx.get_signature())
+    // .collect();
+
+    //     let status_vec = &rpc_client
+    //         .get_signature_statuses(&tx_signatures)
+    //         .await
+    //         .map_err(|e| Error::RpcError(e))?
+    //         .value;
+
+    //     for status in status_vec {
+    //         if let Some(confirmation) = status {
+    //             if let Some(error) = &confirmation.err {
+    //                 return Err(Error::TransactionError(error.clone()));
+    //             }
+    //             let confirm_status = confirmation.confirmation_status();
+    //             match confirm_status {
+    //                 solana_transaction_status::TransactionConfirmationStatus::Processed => continue,
+    //                 solana_transaction_status::TransactionConfirmationStatus::Confirmed
+    //                 | solana_transaction_status::TransactionConfirmationStatus::Finalized => break,
+    //                 _ => return Err(Error::FetchBalanceError),
+    //             };
+    //         }
+    //         time::sleep(Duration::from_millis(500)).await
+    //     }
 
     Ok(buffer_account.pubkey().to_string())
 }

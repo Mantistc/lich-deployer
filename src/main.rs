@@ -121,8 +121,8 @@ impl Application for BlichDeployer {
                     Message::ProgramDeployed,
                 )
             }
-            Message::ProgramDeployed(Ok((buffer))) => {
-                println!("Deployed");
+            Message::ProgramDeployed(Ok(buffer)) => {
+                println!("Deployed!");
                 self.buffer_account = buffer;
                 Command::none()
             }
