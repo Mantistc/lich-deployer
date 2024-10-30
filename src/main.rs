@@ -1,16 +1,22 @@
 use components::{
-    deploy_program_btn, error, keypair_pbkey_address, load_keypair_btn, load_program_btn,
+    buffer_address, deploy_program_btn, error, keypair_pbkey_address, load_keypair_btn,
+    load_program_btn,
 };
 use iced::{
     executor,
     widget::{column, container},
     Application, Command, Element, Renderer, Settings, Theme,
 };
+use program::process_transactions;
 use solana_client::nonblocking::rpc_client::RpcClient;
-use std::{io::{BufRead, BufReader}, sync::Arc};
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
 use std::thread;
+use std::{
+    io::{BufRead, BufReader},
+    sync::{Arc, Mutex},
+};
+use tokio::sync::mpsc;
 mod components;
 mod errors;
 mod files;
@@ -30,9 +36,10 @@ const RPC_URL: &str = "https://api.devnet.solana.com";
 
 struct BlichDeployer {
     pub keypair_path: Option<PathBuf>,
-    pub keypair: Keypair,
+    pub keypair: Arc<Keypair>,
     pub program_path: Option<PathBuf>,
     pub rpc_client: Arc<RpcClient>,
+    pub buffer_account: String,
     pub error: Option<Error>,
 }
 
@@ -42,7 +49,9 @@ enum Message {
     LoadProgramAuthority(Result<PathBuf, Error>),
     PickProgram,
     LoadProgram(Result<PathBuf, Error>),
-    DeployProgram(PathBuf, PathBuf),
+    DeployProgram(PathBuf),
+    ProgramDeployed(Result<String, Error>),
+    InProcessValues(String),
 }
 
 impl Application for BlichDeployer {
@@ -60,7 +69,8 @@ impl Application for BlichDeployer {
                 keypair_path: None,
                 program_path: None,
                 rpc_client: Arc::new(RpcClient::new(RPC_URL.to_string())),
-                keypair: Keypair::new(),
+                keypair: Keypair::new().into(),
+                buffer_account: String::from("buffer fam"),
                 error: None,
             },
             Command::perform(
@@ -95,7 +105,34 @@ impl Application for BlichDeployer {
                 self.error = Some(err);
                 Command::none()
             }
-            Message::DeployProgram(program_path, keypair_path) => {
+            Message::DeployProgram(program_path) => {
+                let values = Arc::new(BlichDeployer {
+                    keypair_path: self.keypair_path.clone(),
+                    keypair: self.keypair.clone(),
+                    program_path: self.program_path.clone(),
+                    rpc_client: self.rpc_client.clone(),
+                    buffer_account: self.buffer_account.clone(),
+                    error: self.error.clone(),
+                });
+
+                let values_clone = Arc::clone(&values);
+                Command::perform(
+                    process_transactions(program_path, values_clone),
+                    Message::ProgramDeployed,
+                )
+            }
+            Message::ProgramDeployed(Ok((buffer))) => {
+                println!("Deployed");
+                self.buffer_account = buffer;
+                Command::none()
+            }
+            Message::ProgramDeployed(Err(e)) => {
+                self.error = Some(e);
+                Command::none()
+            }
+            Message::InProcessValues(value) => {
+                println!("Hello yo yo");
+                self.buffer_account = value;
                 Command::none()
             }
         }
@@ -116,13 +153,15 @@ impl Application for BlichDeployer {
 
         let load_keypair_btn = load_keypair_btn();
         let display_pubkey = keypair_pbkey_address(keypair_path.to_path_buf());
+        let buffer_acc = buffer_address(&self.buffer_account);
         let display_error = error(&self.error);
         let load_program_btn = load_program_btn();
-        let deploy_program_btn = deploy_program_btn(program_path, keypair_path);
+        let deploy_program_btn = deploy_program_btn(program_path);
 
         container(
             column![
                 display_pubkey,
+                buffer_acc,
                 load_keypair_btn,
                 load_program_btn,
                 display_error,
@@ -142,3 +181,4 @@ impl Application for BlichDeployer {
         Theme::Dark
     }
 }
+

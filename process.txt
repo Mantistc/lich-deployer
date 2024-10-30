@@ -1,0 +1,9 @@
+process
+
+the fn is executed
+get create buffer account instructions
+create a transaction & execute it
+
+create all write instructions and put it into individual tx
+returns all signed tx
+

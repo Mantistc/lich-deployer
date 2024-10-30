@@ -26,17 +26,24 @@ pub fn keypair_pbkey_address(file_path: PathBuf) -> Element<'static, Message> {
     pubkey_container.into()
 }
 
+pub fn buffer_address(buffer: &str) -> Element<'static, Message> {
+    let label = text(format!("Buffer Address: ",))
+        .size(14)
+        .style(color!(0x30cbf2));
+
+    let value = text(buffer).size(14);
+
+    let container = column![label, value];
+    container.into()
+}
+
 pub fn load_program_btn() -> Element<'static, Message> {
     let load_btn = button("Load Program Binaries").on_press(Message::PickProgram);
     load_btn.into()
 }
 
-pub fn deploy_program_btn(
-    program_path: PathBuf,
-    keypair_path: PathBuf,
-) -> Element<'static, Message> {
-    let load_btn = button("Load Program Binaries")
-        .on_press(Message::DeployProgram(program_path, keypair_path));
+pub fn deploy_program_btn(program_path: PathBuf) -> Element<'static, Message> {
+    let load_btn = button("Deploy").on_press(Message::DeployProgram(program_path));
     load_btn.into()
 }
 
