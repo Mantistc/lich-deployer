@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use crate::{errors::Error, keypair::load_keypair_from_file, Message};
 use iced::{
     color,
-    widget::{button, column, text},
+    widget::{button, column, progress_bar, text, text_input},
     Element,
 };
 use solana_sdk::signer::Signer;
@@ -37,6 +37,17 @@ pub fn buffer_address(buffer: &str) -> Element<'static, Message> {
     container.into()
 }
 
+pub fn tx_progress(current: usize, total: usize) -> Element<'static, Message> {
+    let label = text(format!("Transaction progress: ",))
+        .size(14)
+        .style(color!(0x30cbf2));
+
+    let progress_bar = progress_bar(0.0..=total as f32, current as f32);
+
+    let container = column![label, progress_bar];
+    container.into()
+}
+
 pub fn load_program_btn() -> Element<'static, Message> {
     let load_btn = button("Load Program Binaries").on_press(Message::PickProgram);
     load_btn.into()
@@ -45,6 +56,17 @@ pub fn load_program_btn() -> Element<'static, Message> {
 pub fn deploy_program_btn(program_path: PathBuf) -> Element<'static, Message> {
     let load_btn = button("Deploy").on_press(Message::DeployProgram(program_path));
     load_btn.into()
+}
+
+pub fn handle_rpc_url(url: &str) -> Element<'static, Message> {
+    let label = text(format!("RPC Client URL: ",))
+        .size(14)
+        .style(color!(0x30cbf2));
+
+    let value = text_input("",url).size(14).on_input(Message::RpcClient);
+
+    let container = column![label, value];
+    container.into()
 }
 
 pub fn error(error: &Option<Error>) -> Element<'static, Message> {

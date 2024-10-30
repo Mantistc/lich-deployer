@@ -1,6 +1,6 @@
 use components::{
-    buffer_address, deploy_program_btn, error, keypair_pbkey_address, load_keypair_btn,
-    load_program_btn,
+    buffer_address, deploy_program_btn, error, handle_rpc_url, keypair_pbkey_address,
+    load_keypair_btn, load_program_btn, tx_progress,
 };
 use iced::{
     executor,
@@ -10,12 +10,7 @@ use iced::{
 use program::process_transactions;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use std::path::{Path, PathBuf};
-use std::process::{Command as StdCommand, Stdio};
-use std::thread;
-use std::{
-    io::{BufRead, BufReader},
-    sync::{Arc, Mutex},
-};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 mod components;
 mod errors;
@@ -24,7 +19,7 @@ mod keypair;
 mod program;
 
 use errors::Error;
-use files::{default_keypair_path, pick_file, FileType, DEFAULT_LOCATION};
+use files::{default_keypair_path, pick_file, FileType};
 use keypair::load_keypair_from_file;
 use solana_sdk::signature::Keypair;
 
@@ -40,6 +35,7 @@ struct BlichDeployer {
     pub program_path: Option<PathBuf>,
     pub rpc_client: Arc<RpcClient>,
     pub buffer_account: String,
+    pub transactions: (usize, usize),
     pub error: Option<Error>,
 }
 
@@ -51,7 +47,8 @@ enum Message {
     LoadProgram(Result<PathBuf, Error>),
     DeployProgram(PathBuf),
     ProgramDeployed(Result<String, Error>),
-    InProcessValues(String),
+    RpcClient(String),
+    UpdateProgress((usize, usize)),
 }
 
 impl Application for BlichDeployer {
@@ -71,6 +68,7 @@ impl Application for BlichDeployer {
                 rpc_client: Arc::new(RpcClient::new(RPC_URL.to_string())),
                 keypair: Keypair::new().into(),
                 buffer_account: String::from("buffer fam"),
+                transactions: (0, 0),
                 error: None,
             },
             Command::perform(
@@ -112,12 +110,14 @@ impl Application for BlichDeployer {
                     program_path: self.program_path.clone(),
                     rpc_client: self.rpc_client.clone(),
                     buffer_account: self.buffer_account.clone(),
+                    transactions: self.transactions,
                     error: self.error.clone(),
                 });
 
-                let values_clone = Arc::clone(&values);
+                // TODO: configure channels to enable communication
+                let (progress_sender, mut progress_receiver) = mpsc::channel::<(usize, usize)>(500);
                 Command::perform(
-                    process_transactions(program_path, values_clone),
+                    process_transactions(program_path, Arc::clone(&values), progress_sender),
                     Message::ProgramDeployed,
                 )
             }
@@ -130,9 +130,13 @@ impl Application for BlichDeployer {
                 self.error = Some(e);
                 Command::none()
             }
-            Message::InProcessValues(value) => {
-                println!("Hello yo yo");
-                self.buffer_account = value;
+            Message::UpdateProgress(values) => {
+                println!("print something");
+                self.transactions = values;
+                Command::none()
+            }
+            Message::RpcClient(rpc_client) => {
+                self.rpc_client = Arc::new(RpcClient::new(rpc_client));
                 Command::none()
             }
         }
@@ -156,16 +160,20 @@ impl Application for BlichDeployer {
         let buffer_acc = buffer_address(&self.buffer_account);
         let display_error = error(&self.error);
         let load_program_btn = load_program_btn();
+        let tx_progress = tx_progress(self.transactions.0, self.transactions.1);
+        let set_rpc_client = handle_rpc_url(&self.rpc_client.url());
         let deploy_program_btn = deploy_program_btn(program_path);
 
         container(
             column![
                 display_pubkey,
                 buffer_acc,
+                set_rpc_client,
                 load_keypair_btn,
                 load_program_btn,
                 display_error,
-                deploy_program_btn
+                deploy_program_btn,
+                tx_progress,
             ]
             .spacing(14),
         )
@@ -181,4 +189,3 @@ impl Application for BlichDeployer {
         Theme::Dark
     }
 }
-

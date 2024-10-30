@@ -21,7 +21,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tokio::{spawn, time};
+use tokio::{spawn, sync::mpsc, time};
 
 use crate::{errors::Error, BlichDeployer, Message};
 
@@ -79,6 +79,7 @@ pub fn write_data(
 pub async fn process_transactions(
     program_path: PathBuf,
     state: Arc<BlichDeployer>,
+    progress_sender: mpsc::Sender<(usize,usize)>,
 ) -> Result<String, Error> {
     let program_bytes =
         get_program_bytes(program_path.to_str().unwrap_or("")).unwrap_or(Vec::new());
@@ -167,6 +168,8 @@ pub async fn process_transactions(
 
     for transaction in write_data_txs.clone() {
         tx_sent += 1;
+        // this is working but the app is not updating the messages correctly (TODO: need to find why)
+        let _ = progress_sender.send((tx_sent, write_data_txs.len())).await;
         let client = rpc_client.clone();
         let config = send_cfg.clone();
         let tx = transaction.clone();
@@ -177,7 +180,6 @@ pub async fn process_transactions(
         });
         time::sleep(Duration::from_millis(25)).await
     }
-
 
     // TODO: check tx statuses and retry
 
@@ -255,7 +257,6 @@ pub fn get_program_bytes(program_path: &str) -> Result<Vec<u8>, InstructionError
     match fs::read(program_path) {
         Ok(bytes) => {
             println!("bytes len: {}", bytes.len());
-            println!("first 10 bytes: {:?}", &bytes[..10]);
             if bytes.len() == 0 {
                 return Err(InstructionError::ProgramEnvironmentSetupFailure);
             }
