@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use crate::{errors::Error, keypair::load_keypair_from_file, Message};
 use iced::{
     color,
-    widget::{button, column, progress_bar, text, text_input},
+    widget::{button, column, progress_bar, row, text, text_input},
     Element,
 };
 use solana_sdk::signer::Signer;
@@ -41,10 +41,10 @@ pub fn tx_progress(current: usize, total: usize) -> Element<'static, Message> {
     let label = text(format!("Transaction progress: ",))
         .size(14)
         .style(color!(0x30cbf2));
-
+    let values = text(format!("{}/{}", current, total)).size(14);
     let progress_bar = progress_bar(0.0..=total as f32, current as f32);
-
-    let container = column![label, progress_bar];
+    let counter = row![label, values];
+    let container = column![counter, progress_bar];
     container.into()
 }
 
@@ -63,7 +63,7 @@ pub fn handle_rpc_url(url: &str) -> Element<'static, Message> {
         .size(14)
         .style(color!(0x30cbf2));
 
-    let value = text_input("",url).size(14).on_input(Message::RpcClient);
+    let value = text_input("", url).size(14).on_input(Message::RpcClient);
 
     let container = column![label, value];
     container.into()

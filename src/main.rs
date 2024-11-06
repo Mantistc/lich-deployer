@@ -5,13 +5,13 @@ use components::{
 use iced::{
     executor,
     widget::{column, container},
-    Application, Command, Element, Renderer, Settings, Theme,
+    Application, Command, Element, Renderer, Settings, Subscription, Theme,
 };
-use program::process_transactions;
+use program::{process_transactions, progress_subscription, Progress};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 mod components;
 mod errors;
 mod files;
@@ -36,6 +36,8 @@ struct BlichDeployer {
     pub rpc_client: Arc<RpcClient>,
     pub buffer_account: String,
     pub transactions: (usize, usize),
+    pub is_deploying: bool,
+    pub progress_receiver: Arc<Mutex<Option<mpsc::Receiver<(usize, usize)>>>>,
     pub error: Option<Error>,
 }
 
@@ -48,7 +50,7 @@ enum Message {
     DeployProgram(PathBuf),
     ProgramDeployed(Result<String, Error>),
     RpcClient(String),
-    UpdateProgress((usize, usize)),
+    UpdateProgress(Progress),
 }
 
 impl Application for BlichDeployer {
@@ -67,8 +69,10 @@ impl Application for BlichDeployer {
                 program_path: None,
                 rpc_client: Arc::new(RpcClient::new(RPC_URL.to_string())),
                 keypair: Keypair::new().into(),
-                buffer_account: String::from("buffer fam"),
+                buffer_account: String::from("Non created buffer account"),
                 transactions: (0, 0),
+                progress_receiver: Arc::new(Mutex::new(None)),
+                is_deploying: false,
                 error: None,
             },
             Command::perform(
@@ -104,6 +108,9 @@ impl Application for BlichDeployer {
                 Command::none()
             }
             Message::DeployProgram(program_path) => {
+                self.transactions = (0,0);
+                let (progress_sender, progress_receiver) = mpsc::channel::<(usize, usize)>(256);
+                let is_deploying = true;
                 let values = Arc::new(BlichDeployer {
                     keypair_path: self.keypair_path.clone(),
                     keypair: self.keypair.clone(),
@@ -112,10 +119,12 @@ impl Application for BlichDeployer {
                     buffer_account: self.buffer_account.clone(),
                     transactions: self.transactions,
                     error: self.error.clone(),
+                    is_deploying,
+                    progress_receiver: Arc::new(Mutex::new(None)),
                 });
 
-                // TODO: configure channels to enable communication
-                let (progress_sender, mut progress_receiver) = mpsc::channel::<(usize, usize)>(500);
+                self.progress_receiver = Arc::new(Mutex::new(Some(progress_receiver)));
+                self.is_deploying = is_deploying;
                 Command::perform(
                     process_transactions(program_path, Arc::clone(&values), progress_sender),
                     Message::ProgramDeployed,
@@ -130,15 +139,35 @@ impl Application for BlichDeployer {
                 self.error = Some(e);
                 Command::none()
             }
-            Message::UpdateProgress(values) => {
-                println!("print something");
-                self.transactions = values;
+            Message::UpdateProgress(progress) => {
+                match progress {
+                    Progress::Sending { sent, total } => {
+                        self.transactions = (sent, total);
+                    }
+                    Progress::Completed => {
+                        self.is_deploying = false;
+                        self.progress_receiver = Arc::new(Mutex::new(None));
+                    }
+                    Progress::Idle=>{
+                        println!("Starting")
+                    }
+                }
                 Command::none()
             }
             Message::RpcClient(rpc_client) => {
                 self.rpc_client = Arc::new(RpcClient::new(rpc_client));
                 Command::none()
             }
+        }
+    }
+
+    fn subscription(&self) -> Subscription<Self::Message> {
+        match self.is_deploying {
+            true => {
+                let progress_receiver = Arc::clone(&self.progress_receiver);
+                progress_subscription(progress_receiver).map(Message::UpdateProgress)
+            }
+            false => Subscription::none(),
         }
     }
 

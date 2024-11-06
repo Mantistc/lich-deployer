@@ -1,4 +1,8 @@
-use iced::{futures::future::join_all, Command};
+use iced::subscription::channel;
+use iced::{
+    futures::{channel, stream},
+    Subscription,
+};
 use solana_client::{
     nonblocking::rpc_client::RpcClient, rpc_client::SerializableTransaction,
     rpc_config::RpcSendTransactionConfig,
@@ -8,20 +12,18 @@ use solana_sdk::{
     commitment_config::{CommitmentConfig, CommitmentLevel},
     hash::Hash,
     instruction::{Instruction, InstructionError},
-    message::{v0::Message as TransactionMessage, MessageHeader, VersionedMessage},
     pubkey::Pubkey,
     signature::{Keypair, Signature},
     signer::Signer,
     transaction::{Transaction, TransactionError, VersionedTransaction},
 };
 use solana_transaction_status::UiTransactionEncoding;
-use std::{
-    fs,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-    time::Duration,
+use std::{fs, path::PathBuf, sync::Arc, time::Duration};
+use tokio::{
+    spawn,
+    sync::{mpsc, Mutex},
+    time,
 };
-use tokio::{spawn, sync::mpsc, time};
 
 use crate::{errors::Error, BlichDeployer, Message};
 
@@ -79,7 +81,7 @@ pub fn write_data(
 pub async fn process_transactions(
     program_path: PathBuf,
     state: Arc<BlichDeployer>,
-    progress_sender: mpsc::Sender<(usize,usize)>,
+    progress_sender: mpsc::Sender<(usize, usize)>,
 ) -> Result<String, Error> {
     let program_bytes =
         get_program_bytes(program_path.to_str().unwrap_or("")).unwrap_or(Vec::new());
@@ -105,7 +107,6 @@ pub async fn process_transactions(
     if lamports == 0 {
         return Err(Error::InvalidAmount);
     }
-
     let (buffer_account, buffer_acc_init_tx) =
         create_buffer_account(&authority, lamports, &program_bytes, recent_blockhash)
             .map_err(|e| Error::InstructionError(e))?;
@@ -155,7 +156,7 @@ pub async fn process_transactions(
         return Err(Error::FetchBlockhashError);
     };
 
-    let write_data_txs = write_data(
+    let mut write_data_txs = write_data(
         &buffer_account.pubkey(),
         &program_bytes,
         &authority,
@@ -168,50 +169,110 @@ pub async fn process_transactions(
 
     for transaction in write_data_txs.clone() {
         tx_sent += 1;
-        // this is working but the app is not updating the messages correctly (TODO: need to find why)
         let _ = progress_sender.send((tx_sent, write_data_txs.len())).await;
         let client = rpc_client.clone();
         let config = send_cfg.clone();
         let tx = transaction.clone();
-        println!("tx Nº: {}", tx_sent);
-        println!("sending tx: {:?}", transaction.get_signature().to_string());
         spawn(async move {
             let _ = client.send_transaction_with_config(&tx, config).await;
         });
-        time::sleep(Duration::from_millis(25)).await
+        // time::sleep(Duration::from_millis(25)).await
     }
 
-    // TODO: check tx statuses and retry
+    let tx_signatures: Vec<Signature> = write_data_txs
+        .clone()
+        .into_iter()
+        .map(|tx| *tx.get_signature())
+        .take(200)
+        .collect();
 
-    // let tx_signatures: Vec<Signature> = write_data_txs
-    // .clone()
-    // .into_iter()
-    // .map(|tx| *tx.get_signature())
-    // .collect();
+    loop {
+        tx_sent = 0;
+        let mut tx_to_retry: Vec<Signature> = Vec::new();
 
-    //     let status_vec = &rpc_client
-    //         .get_signature_statuses(&tx_signatures)
-    //         .await
-    //         .map_err(|e| Error::RpcError(e))?
-    //         .value;
+        let status_vec = &rpc_client
+            .get_signature_statuses(&tx_signatures)
+            .await
+            .map_err(|e| Error::RpcError(e))?
+            .value;
 
-    //     for status in status_vec {
-    //         if let Some(confirmation) = status {
-    //             if let Some(error) = &confirmation.err {
-    //                 return Err(Error::TransactionError(error.clone()));
-    //             }
-    //             let confirm_status = confirmation.confirmation_status();
-    //             match confirm_status {
-    //                 solana_transaction_status::TransactionConfirmationStatus::Processed => continue,
-    //                 solana_transaction_status::TransactionConfirmationStatus::Confirmed
-    //                 | solana_transaction_status::TransactionConfirmationStatus::Finalized => break,
-    //                 _ => return Err(Error::FetchBalanceError),
-    //             };
-    //         }
-    //         time::sleep(Duration::from_millis(500)).await
-    //     }
+        for (i, status) in status_vec.iter().enumerate() {
+            if let Some(confirmation) = status {
+                if confirmation.err.is_some() {
+                    tx_to_retry.push(tx_signatures[i]);
+                }
+            } else {
+                tx_to_retry.push(tx_signatures[i]);
+            }
+        }
+        let save_last_value = write_data_txs.clone();
+        write_data_txs = Vec::new();
 
+        for signature in &tx_to_retry {
+            let mut tx_from_signature = None;
+
+            for tx in save_last_value.clone() {
+                let write_tx_signature = tx.get_signature();
+                if *write_tx_signature == *signature {
+                    println!("equal?: {:?}", *write_tx_signature == *signature);
+                    tx_from_signature = Some(tx);
+                    break;
+                }
+            }
+            if let Some(tx) = tx_from_signature {
+                write_data_txs.push(tx);
+            }
+        }
+        println!(
+            "tx to retry: {}, tx array len: {}",
+            tx_to_retry.clone().len(),
+            write_data_txs.len()
+        );
+
+        for transaction in write_data_txs.clone() {
+            println!("tx sent: {}, total: {}", tx_sent, write_data_txs.len());
+            tx_sent += 1;
+            let _ = progress_sender.send((tx_sent, write_data_txs.len())).await;
+            let client = rpc_client.clone();
+            let config = send_cfg.clone();
+            let tx = transaction.clone();
+            spawn(async move {
+                let _ = client.send_transaction_with_config(&tx, config).await;
+            });
+            time::sleep(Duration::from_millis(25)).await
+        }
+        if tx_to_retry.len() == 0 {
+            break;
+        }
+    }
     Ok(buffer_account.pubkey().to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Progress {
+    Sending { sent: usize, total: usize },
+    Completed,
+    Idle,
+}
+
+pub fn progress_subscription(
+    progress_receiver: Arc<Mutex<Option<mpsc::Receiver<(usize, usize)>>>>,
+) -> Subscription<Progress> {
+    iced::subscription::unfold("progress_subscription", (), move |_| {
+        let progress_receiver = Arc::clone(&progress_receiver);
+        async move {
+            let mut receiver = progress_receiver.lock().await;
+            if let Some(ref mut rx) = *receiver {
+                if let Some((sent, total)) = rx.recv().await {
+                    (Progress::Sending { sent, total }, ())
+                } else {
+                    (Progress::Completed, ())
+                }
+            } else {
+                (Progress::Idle, ())
+            }
+        }
+    })
 }
 
 pub fn deploy_program(
