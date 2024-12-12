@@ -7,7 +7,7 @@ use iced::{
 use programs::{progress_subscription, BPrograms, Progress};
 use settings::BSettings;
 use solana_client::nonblocking::rpc_client::RpcClient;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 mod components;
@@ -101,18 +101,22 @@ impl Application for Blich {
             Message::DeployProgram => {
                 self.programs.transactions = (0, 0);
                 let (progress_sender, progress_receiver) = mpsc::channel::<(usize, usize)>(10000);
-                let is_deploying = true;
                 self.programs.receiver_data_channel = Arc::new(Mutex::new(Some(progress_receiver)));
-                self.programs.is_running = is_deploying;
-
+                self.programs.is_deploying = true;
                 Command::perform(
-                    BPrograms::create_buffer_and_write_data(self.programs.clone(),self.settings.clone(), progress_sender),
+                    BPrograms::create_buffer_and_write_data(
+                        self.programs.clone(),
+                        self.settings.clone(),
+                        progress_sender,
+                    ),
                     Message::ProgramDeployed,
                 )
             }
             Message::ProgramDeployed(Ok(buffer)) => {
                 println!("Deployed!");
                 self.programs.buffer_account = buffer;
+                self.programs.is_deployed = true;
+                self.programs.is_deploying = false;
                 Command::none()
             }
             Message::ProgramDeployed(Err(e)) => {
@@ -122,10 +126,11 @@ impl Application for Blich {
             Message::UpdateProgress(progress) => {
                 match progress {
                     Progress::Sending { sent, total } => {
+                        self.programs.is_deployed = false;
                         self.programs.transactions = (sent, total);
                     }
                     Progress::Completed => {
-                        self.programs.is_running = false;
+                        self.programs.is_deployed = true;
                         self.programs.receiver_data_channel = Arc::new(Mutex::new(None));
                     }
                     Progress::Idle => {
@@ -142,7 +147,7 @@ impl Application for Blich {
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
-        match self.programs.is_running {
+        match self.programs.is_deploying {
             true => {
                 let progress_receiver = Arc::clone(&self.programs.receiver_data_channel);
                 progress_subscription(progress_receiver).map(Message::UpdateProgress)
@@ -153,6 +158,7 @@ impl Application for Blich {
 
     fn view(&self) -> Element<'_, Self::Message, Renderer<Self::Theme>> {
         let settings = self.settings.view();
+        let is_deployed = self.programs.view();
         let buffer_acc = buffer_address(&self.programs.buffer_account.clone().pubkey().to_string());
         let display_error = error(&self.error);
         let tx_progress = tx_progress(self.programs.transactions.0, self.programs.transactions.1);
@@ -165,6 +171,7 @@ impl Application for Blich {
                 deploy_program_btn,
                 tx_progress,
                 display_error,
+                is_deployed
             ]
             .spacing(14),
         )

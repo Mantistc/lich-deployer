@@ -1,4 +1,6 @@
 use iced::subscription::channel;
+use iced::widget::text;
+use iced::{color, Element};
 use iced::{
     futures::{channel, stream},
     Subscription,
@@ -38,7 +40,8 @@ pub struct BPrograms {
     pub buffer_account: Arc<Keypair>,
     pub program_size: usize,
     pub transactions: (usize, usize),
-    pub is_running: bool,
+    pub is_deployed: bool,
+    pub is_deploying: bool,
     pub receiver_data_channel: Arc<Mutex<Option<mpsc::Receiver<(usize, usize)>>>>,
     pub sender_data_channel: Option<mpsc::Sender<(usize, usize)>>,
 }
@@ -49,7 +52,8 @@ impl Default for BPrograms {
             buffer_account: Keypair::new().into(),
             program_size: 0,
             transactions: (0, 0),
-            is_running: false,
+            is_deployed: false,
+            is_deploying: false,
             receiver_data_channel: Arc::new(Mutex::new(None)),
             sender_data_channel: None,
         }
@@ -166,7 +170,7 @@ impl BPrograms {
             spawn(async move {
                 let _ = client.send_transaction_with_config(&tx, config).await;
             });
-            // time::sleep(Duration::from_millis(25)).await
+            time::sleep(Duration::from_millis(25)).await
         }
 
         let tx_signatures: Vec<Signature> = write_data_txs
@@ -232,10 +236,21 @@ impl BPrograms {
                 time::sleep(Duration::from_millis(25)).await
             }
             if tx_to_retry.len() == 0 {
+                let _ = sender_channel.send((0, 0)).await;
                 break;
             }
+            time::sleep(Duration::from_millis(2000)).await
         }
         Ok(buffer_acc)
+    }
+
+    pub fn view(&self) -> Element<'static, Message> {
+        let is_deployed = if self.is_deployed {
+            text("is deployed!").size(14).style(color!(0x30cbf2))
+        } else {
+            text("").size(14)
+        };
+        is_deployed.into()
     }
 }
 
@@ -245,7 +260,7 @@ pub fn create_buffer_account(
     lamports: u64,
     program_bytes: &Vec<u8>,
     recent_blockhash: Hash,
-) -> Result<(Transaction), InstructionError> {
+) -> Result<Transaction, InstructionError> {
     println!("lamports: {}, bytes: {:?}", lamports, program_bytes.len());
     let create_buffer_ix = create_buffer(
         &authority.pubkey(),
