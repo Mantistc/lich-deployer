@@ -1,61 +1,45 @@
-use iced::subscription::channel;
-use iced::widget::text;
-use iced::{color, Element};
-use iced::{
-    futures::{channel, stream},
-    Subscription,
-};
-use solana_client::{
-    nonblocking::rpc_client::RpcClient, rpc_client::SerializableTransaction,
-    rpc_config::RpcSendTransactionConfig,
-};
+use iced::futures::channel::mpsc::Sender;
+use iced::futures::{Stream, StreamExt};
+use iced::stream::try_channel;
+use iced::widget::{button, column, row, text};
+use iced::{color, Element, Subscription};
+use solana_client::{rpc_client::SerializableTransaction, rpc_config::RpcSendTransactionConfig};
 use solana_sdk::{
-    bpf_loader_upgradeable::{create_buffer, deploy_with_max_program_len, upgrade, write},
     commitment_config::{CommitmentConfig, CommitmentLevel},
-    hash::Hash,
-    instruction::{Instruction, InstructionError},
-    pubkey::Pubkey,
     signature::{Keypair, Signature},
     signer::Signer,
-    transaction::{Transaction, TransactionError, VersionedTransaction},
 };
 use solana_transaction_status::UiTransactionEncoding;
-use std::path::Path;
-use std::{fs, path::PathBuf, sync::Arc, time::Duration};
-use tokio::net::unix::pipe::Sender;
-use tokio::{
-    spawn,
-    sync::{mpsc, Mutex},
-    time,
-};
+use std::hash::Hash;
+use std::{fs, sync::Arc, time::Duration};
+use tokio::{spawn, time};
 
+use crate::components::copy_to_cliboard_btn;
+use crate::instructions::{create_buffer_account, write_data};
 use crate::settings::BSettings;
-use crate::{errors::Error, Blich, Message};
+use crate::transactions::send_tx_and_verify_status;
+use crate::{errors::Error, Message};
 
-const BYTES_PER_CHUNK: usize = 1011;
-const PROGRAM_EXTRA_SPACE: usize = 45;
+pub const BYTES_PER_CHUNK: usize = 1012;
+pub const PROGRAM_EXTRA_SPACE: usize = 45;
 
 #[derive(Debug, Clone)]
 pub struct BPrograms {
     pub buffer_account: Arc<Keypair>,
-    pub program_size: usize,
+    pub program_bytes: Vec<u8>,
     pub transactions: (usize, usize),
     pub is_deployed: bool,
     pub is_deploying: bool,
-    pub receiver_data_channel: Arc<Mutex<Option<mpsc::Receiver<(usize, usize)>>>>,
-    pub sender_data_channel: Option<mpsc::Sender<(usize, usize)>>,
 }
 
 impl Default for BPrograms {
     fn default() -> Self {
         Self {
             buffer_account: Keypair::new().into(),
-            program_size: 0,
+            program_bytes: Vec::new(),
             transactions: (0, 0),
             is_deployed: false,
             is_deploying: false,
-            receiver_data_channel: Arc::new(Mutex::new(None)),
-            sender_data_channel: None,
         }
     }
 }
@@ -64,44 +48,34 @@ impl BPrograms {
     pub async fn create_buffer_and_write_data(
         self,
         settings: BSettings,
-        sender_channel: mpsc::Sender<(usize, usize)>,
-    ) -> Result<Arc<Keypair>, Error> {
+        mut output: Sender<Progress>,
+    ) -> Result<(), Error> {
+        let _ = output.try_send(Progress::Idle);
         let buffer_acc = self.buffer_account;
-        let program_path = settings
-            .program_path
-            .as_deref()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from(""));
-
-        let program_bytes =
-            get_program_bytes(program_path.to_str().unwrap_or("")).unwrap_or(Vec::new());
 
         let authority = settings.keypair.clone();
         let rpc_client = settings.rpc_client.clone();
 
-        let blockhash_result = rpc_client
+        let (recent_blockhash, _) = rpc_client
             .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
-            .await;
-
-        let recent_blockhash = if let Ok((blockhash_info, _)) = blockhash_result {
-            blockhash_info
-        } else {
-            return Err(Error::FetchBlockhashError);
-        };
+            .await
+            .map_err(|e| Error::RpcError(e))?;
 
         let lamports = rpc_client
-            .get_minimum_balance_for_rent_exemption(program_bytes.len() + PROGRAM_EXTRA_SPACE)
+            .get_minimum_balance_for_rent_exemption(self.program_bytes.len() + PROGRAM_EXTRA_SPACE)
             .await
             .unwrap_or(0);
 
-        if lamports == 0 {
-            return Err(Error::InvalidAmount);
+        if self.program_bytes.len() == 0 {
+            println!("error");
+            return Err(Error::InvalidProgramLen);
         }
+
         let buffer_acc_init_tx = create_buffer_account(
             &buffer_acc,
             &authority,
             lamports,
-            &program_bytes,
+            &self.program_bytes,
             recent_blockhash,
         )
         .map_err(|e| Error::InstructionError(e))?;
@@ -114,92 +88,70 @@ impl BPrograms {
             min_context_slot: None,
         };
 
-        let signature = rpc_client
-            .send_transaction_with_config(&buffer_acc_init_tx, send_cfg)
+        let _signature =
+            send_tx_and_verify_status(&rpc_client, &buffer_acc_init_tx, send_cfg).await;
+
+        let (updated_blockhash, _) = rpc_client
+            .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
             .await
             .map_err(|e| Error::RpcError(e))?;
 
-        loop {
-            let status = &rpc_client
-                .get_signature_statuses(&[signature])
-                .await
-                .map_err(|e| Error::RpcError(e))?
-                .value[0];
-
-            if let Some(confirmation) = status {
-                if let Some(error) = &confirmation.err {
-                    return Err(Error::TransactionError(error.clone()));
-                }
-                let confirm_status = confirmation.confirmation_status();
-                match confirm_status {
-                    solana_transaction_status::TransactionConfirmationStatus::Processed => continue,
-                    solana_transaction_status::TransactionConfirmationStatus::Confirmed
-                    | solana_transaction_status::TransactionConfirmationStatus::Finalized => break,
-                    _ => return Err(Error::FetchBalanceError),
-                };
-            }
-            time::sleep(Duration::from_millis(500)).await
-        }
-
-        let blockhash_result2 = rpc_client
-            .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
-            .await;
-
-        let updated_blockhash = if let Ok((blockhash_info, _)) = blockhash_result2 {
-            blockhash_info
-        } else {
-            return Err(Error::FetchBlockhashError);
-        };
-
         let mut write_data_txs = write_data(
             &buffer_acc.pubkey(),
-            &program_bytes,
+            &self.program_bytes,
             &authority,
             updated_blockhash,
         );
 
         let mut tx_sent = 0;
+        let sleep_between_send = 15; // 5 ms to await between each send
 
         // send all tx
-        for transaction in write_data_txs.clone() {
+        for transaction in &write_data_txs {
             tx_sent += 1;
-            let _ = sender_channel.send((tx_sent, write_data_txs.len())).await;
+            let _ = output.try_send(Progress::Sending {
+                sent: tx_sent,
+                total: write_data_txs.len(),
+            });
             let client = rpc_client.clone();
             let config = send_cfg.clone();
             let tx = transaction.clone();
             spawn(async move {
                 let _ = client.send_transaction_with_config(&tx, config).await;
             });
-            time::sleep(Duration::from_millis(25)).await
+            time::sleep(Duration::from_millis(sleep_between_send)).await
         }
 
-        let tx_signatures: Vec<Signature> = write_data_txs
-            .clone()
-            .into_iter()
-            .map(|tx| *tx.get_signature())
-            .take(200)
-            .collect();
-
+        // this is required because the method get_signature_statuses only accept a max of 256 signatures
+        let batch_size = 256;
+        // TODO: Get the new signed tx and update the tx_signatures_batches
         loop {
+            let tx_signatures: Vec<Signature> = write_data_txs
+                .clone()
+                .into_iter()
+                .map(|tx| *tx.get_signature())
+                .collect();
+            let tx_signatures_batches = get_vec_with_batched_data(batch_size, &tx_signatures);
             tx_sent = 0;
-            let mut tx_to_retry: Vec<Signature> = Vec::new();
+            let mut tx_to_retry = Vec::new();
+            for chunk_signature in &tx_signatures_batches {
+                let status_vec = &rpc_client
+                    .get_signature_statuses(&chunk_signature)
+                    .await
+                    .map_err(|e| Error::RpcError(e))?
+                    .value;
 
-            let status_vec = &rpc_client
-                .get_signature_statuses(&tx_signatures)
-                .await
-                .map_err(|e| Error::RpcError(e))?
-                .value;
-
-            for (i, status) in status_vec.iter().enumerate() {
-                if let Some(confirmation) = status {
-                    if confirmation.err.is_some() {
+                for (i, status) in status_vec.iter().enumerate() {
+                    if let Some(confirmation) = status {
+                        if confirmation.err.is_some() {
+                            tx_to_retry.push(tx_signatures[i]);
+                        }
+                    } else {
                         tx_to_retry.push(tx_signatures[i]);
                     }
-                } else {
-                    tx_to_retry.push(tx_signatures[i]);
                 }
             }
-            let save_last_value = write_data_txs.clone();
+            let save_last_value = write_data_txs;
             write_data_txs = Vec::new();
 
             for signature in &tx_to_retry {
@@ -217,173 +169,150 @@ impl BPrograms {
                     write_data_txs.push(tx);
                 }
             }
-            println!(
-                "tx to retry: {}, tx array len: {}",
-                tx_to_retry.clone().len(),
-                write_data_txs.len()
-            );
 
-            for transaction in write_data_txs.clone() {
-                println!("tx sent: {}, total: {}", tx_sent, write_data_txs.len());
+            let (updated_blockhash, _) = rpc_client
+                .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+                .await
+                .map_err(|e| Error::RpcError(e))?;
+
+            let tx_len = write_data_txs.len();
+
+            for transaction in write_data_txs.iter_mut() {
+                transaction.sign(&[&authority], updated_blockhash);
                 tx_sent += 1;
-                let _ = sender_channel.send((tx_sent, write_data_txs.len())).await;
+                let _ = output.try_send(Progress::Sending {
+                    sent: tx_sent,
+                    total: tx_len,
+                });
                 let client = rpc_client.clone();
                 let config = send_cfg.clone();
                 let tx = transaction.clone();
                 spawn(async move {
                     let _ = client.send_transaction_with_config(&tx, config).await;
                 });
-                time::sleep(Duration::from_millis(25)).await
+                time::sleep(Duration::from_millis(sleep_between_send)).await
             }
+            println!(
+                "tx sent: {}, total: {}, tx to retry: {}",
+                tx_sent,
+                write_data_txs.len(),
+                tx_to_retry.len()
+            );
             if tx_to_retry.len() == 0 {
-                let _ = sender_channel.send((0, 0)).await;
+                let _ = output.try_send(Progress::Completed {
+                    buffer_account: buffer_acc,
+                });
                 break;
             }
-            time::sleep(Duration::from_millis(2000)).await
+            time::sleep(Duration::from_secs(5)).await
         }
-        Ok(buffer_acc)
+        Ok(())
     }
 
-    pub fn view(&self) -> Element<'static, Message> {
+    // ------> UI COMPONENTS <------ //
+
+    pub fn deployed_message_element(&self) -> Element<Message> {
         let is_deployed = if self.is_deployed {
-            text("is deployed!").size(14).style(color!(0x30cbf2))
+            text("Buffer account created & data writed")
+                .size(14)
+                .color(color!(0x30cbf2))
         } else {
             text("").size(14)
         };
         is_deployed.into()
     }
-}
 
-pub fn create_buffer_account(
-    buffer_account: &Keypair,
-    authority: &Keypair,
-    lamports: u64,
-    program_bytes: &Vec<u8>,
-    recent_blockhash: Hash,
-) -> Result<Transaction, InstructionError> {
-    println!("lamports: {}, bytes: {:?}", lamports, program_bytes.len());
-    let create_buffer_ix = create_buffer(
-        &authority.pubkey(),
-        &buffer_account.pubkey(),
-        &authority.pubkey(),
-        lamports,
-        program_bytes.len(),
-    )?;
-    let mut tx = Transaction::new_with_payer(&create_buffer_ix, Some(&authority.pubkey()));
-    tx.sign(&[&authority, &buffer_account], recent_blockhash);
-
-    Ok(tx)
-}
-
-pub fn write_data(
-    buffer_address: &Pubkey,
-    program_bytes: &Vec<u8>,
-    authority: &Keypair,
-    recent_blockhash: Hash,
-) -> Vec<Transaction> {
-    let mut offset = 0;
-    let mut transactions = Vec::new();
-
-    while offset < program_bytes.len() {
-        let end = (offset + BYTES_PER_CHUNK).min(program_bytes.len());
-
-        let chunk = program_bytes[offset..end].to_vec();
-
-        let write_ix = write(&buffer_address, &authority.pubkey(), offset as u32, chunk);
-
-        offset += BYTES_PER_CHUNK;
-
-        let mut tx = Transaction::new_with_payer(&[write_ix], Some(&authority.pubkey()));
-        tx.sign(&[&authority], recent_blockhash);
-
-        transactions.push(tx)
+    pub fn program_size_element(&self) -> Element<Message> {
+        let column = column![
+            text("Program size: ").color(color!(0x30cbf2)).size(14),
+            text(format!("{} bytes", self.program_bytes.len())).size(14)
+        ];
+        column.into()
     }
 
-    transactions
+    pub fn buffer_address(&self) -> Element<Message> {
+        let buffer_str = self.buffer_account.pubkey().to_string();
+        let label = text(format!("Buffer Address: ",))
+            .size(14)
+            .color(color!(0x30cbf2));
+        let value = text(buffer_str.clone()).size(14);
+        let copy_btn = copy_to_cliboard_btn(&buffer_str);
+        let value_with_copy_btn_row = row![value, copy_btn]
+            .spacing(10)
+            .align_y(iced::Alignment::Center);
+
+        let container = column![label, value_with_copy_btn_row];
+        container.into()
+    }
+
+    pub fn write_data_btn(&self) -> Element<Message> {
+        let write_data_btn = button("Write data").on_press(Message::DeployProgram);
+        write_data_btn.into()
+    }
 }
 
-async fn send_and_retry_txs() -> Result<(), Error> {
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Progress {
-    Idle,
-    Sending { sent: usize, total: usize },
-    Completed,
-}
-
-pub fn progress_subscription(
-    progress_receiver: Arc<Mutex<Option<mpsc::Receiver<(usize, usize)>>>>,
-) -> Subscription<Progress> {
-    iced::subscription::unfold("progress_subscription", (), move |_| {
-        let progress_receiver = Arc::clone(&progress_receiver);
-        async move {
-            let mut receiver = progress_receiver.lock().await;
-            if let Some(ref mut rx) = *receiver {
-                if let Some((sent, total)) = rx.recv().await {
-                    (Progress::Sending { sent, total }, ())
-                } else {
-                    (Progress::Completed, ())
-                }
-            } else {
-                (Progress::Idle, ())
-            }
-        }
-    })
-}
-
-pub fn deploy_program(
-    authority: Keypair,
-    program_keypair: Keypair,
-    buffer_address: &Pubkey,
-    program_bytes: &Vec<u8>,
-    program_lamports: u64,
-) -> Result<Vec<Instruction>, InstructionError> {
-    let payer_address = &authority.pubkey();
-    let program_address = &program_keypair.pubkey();
-    let len = program_bytes.len();
-
-    let deploy_program = deploy_with_max_program_len(
-        payer_address,
-        program_address,
-        buffer_address,
-        payer_address,
-        program_lamports,
-        len,
-    );
-    deploy_program
-}
-
-pub fn upgrade_program(
-    program_keypair: Keypair,
-    buffer_address: &Pubkey,
-    program_bytes: &Vec<u8>,
-    authority: Keypair,
-) -> Instruction {
-    let authority_pubkey = &authority.pubkey();
-    let program_address = &program_keypair.pubkey();
-    let upgrade_program = upgrade(
-        program_address,
-        buffer_address,
-        authority_pubkey,
-        authority_pubkey,
-    );
-    upgrade_program
-}
-
-pub fn get_program_bytes(program_path: &str) -> Result<Vec<u8>, InstructionError> {
+pub fn get_program_bytes(program_path: &str) -> Result<Vec<u8>, Error> {
     match fs::read(program_path) {
         Ok(bytes) => {
             println!("bytes len: {}", bytes.len());
             if bytes.len() == 0 {
-                return Err(InstructionError::ProgramEnvironmentSetupFailure);
+                return Err(Error::InvalidProgramLen);
             }
             Ok(bytes)
         }
         Err(e) => {
             eprintln!("Error: {}", e);
-            return Err(InstructionError::InvalidAccountData);
+            return Err(Error::UnexpectedError);
         }
+    }
+}
+
+pub fn get_vec_with_batched_data<T: Clone>(batch_size: usize, base_vec: &Vec<T>) -> Vec<Vec<T>> {
+    let mut offset = 0;
+    let mut vec_with_batchs = Vec::new();
+
+    while offset < base_vec.len() {
+        let chunk_end = (offset + batch_size).min(base_vec.len());
+
+        let chunk = base_vec[offset..chunk_end].to_vec();
+
+        offset += batch_size;
+        vec_with_batchs.push(chunk);
+    }
+    vec_with_batchs
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Progress {
+    Idle,
+    Sending { sent: usize, total: usize },
+    Completed { buffer_account: Arc<Keypair> },
+}
+
+impl Progress {
+    pub fn sending_tx_progress_sub(
+        programs: BPrograms,
+        settings: BSettings,
+    ) -> impl Stream<Item = Result<Progress, Error>> {
+        try_channel(1000, move |output| async move {
+            let result = BPrograms::create_buffer_and_write_data(programs, settings, output).await;
+            if let Err(_e) = result {
+                return Err(Error::UnexpectedError);
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    pub fn run_susbcription<I: 'static + Hash + Copy + Send + Sync>(
+        id: I,
+        programs: BPrograms,
+        settings: BSettings,
+    ) -> iced::Subscription<(I, Result<Progress, Error>)> {
+        Subscription::run_with_id(
+            id,
+            Progress::sending_tx_progress_sub(programs, settings)
+                .map(move |progress| (id, progress)),
+        )
     }
 }

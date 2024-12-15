@@ -1,29 +1,33 @@
-use components::{buffer_address, deploy_program_btn, error, tx_progress};
+use components::{error, tx_progress};
 use iced::{
-    executor,
+    clipboard,
     widget::{column, container},
-    Application, Command, Element, Renderer, Settings, Subscription, Theme,
+    Element, Subscription, Task, Theme,
 };
-use programs::{progress_subscription, BPrograms, Progress};
-use settings::BSettings;
+use programs::{get_program_bytes, BPrograms, Progress};
+use settings::{keypair_balance, BSettings};
 use solana_client::nonblocking::rpc_client::RpcClient;
-use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use std::{path::PathBuf, time::Duration};
+use tokio::time;
 mod components;
 mod errors;
 mod files;
+mod instructions;
 mod keypair;
 mod programs;
 mod settings;
+mod transactions;
 
 use errors::Error;
 use files::{default_keypair_path, pick_file, FileType};
 use keypair::load_keypair_from_file;
-use solana_sdk::{signature::Keypair, signer::Signer};
 
 fn main() -> iced::Result {
-    Blich::run(Settings::default())
+    iced::application(Blich::title, Blich::update, Blich::view)
+        .theme(Blich::theme)
+        .subscription(Blich::subscription)
+        .run_with(Blich::new)
 }
 
 struct Blich {
@@ -46,129 +50,141 @@ impl Default for Blich {
 enum Message {
     PickProgramAuthority,
     LoadProgramAuthority(Result<PathBuf, Error>),
+    AuthoritySolBalance(Result<u64, Error>),
     PickProgram,
     LoadProgram(Result<PathBuf, Error>),
     DeployProgram,
-    ProgramDeployed(Result<Arc<Keypair>, Error>),
     RpcClient(String),
-    UpdateProgress(Progress),
+    UpdateProgress(Result<Progress, Error>),
+    CopyToCliboard(String),
+    ErrorCleared,
 }
 
-impl Application for Blich {
-    type Executor = executor::Default;
-
-    type Message = Message;
-
-    type Theme = Theme;
-
-    type Flags = ();
-
-    fn new(_flags: Self::Flags) -> (Self, Command<Self::Message>) {
+impl Blich {
+    fn new() -> (Self, Task<Message>) {
         (
             Blich::default(),
-            Command::perform(
+            Task::perform(
                 async { Ok(default_keypair_path()) },
                 Message::LoadProgramAuthority,
             ),
         )
     }
 
-    fn update(&mut self, message: Self::Message) -> Command<Self::Message> {
+    fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::PickProgramAuthority => {
-                Command::perform(pick_file(FileType::Keypair), Message::LoadProgramAuthority)
+                Task::perform(pick_file(FileType::Keypair), Message::LoadProgramAuthority)
             }
             Message::LoadProgramAuthority(Ok(path)) => {
                 self.settings.keypair_path = Some(path.to_path_buf());
                 self.settings.keypair = load_keypair_from_file(path.to_path_buf()).into();
-                Command::none()
+                Task::perform(
+                    keypair_balance(path, self.settings.rpc_client.clone()),
+                    Message::AuthoritySolBalance,
+                )
             }
             Message::LoadProgramAuthority(Err(err)) => {
                 self.error = Some(err);
-                Command::none()
+                Task::perform(Blich::clear_error(), |_| Message::ErrorCleared)
+            }
+            Message::AuthoritySolBalance(Ok(balance)) => {
+                self.settings.balance = Some(balance);
+                Task::none()
+            }
+            Message::AuthoritySolBalance(Err(e)) => {
+                self.error = Some(e);
+                Task::perform(Blich::clear_error(), |_| Message::ErrorCleared)
             }
             Message::PickProgram => {
-                Command::perform(pick_file(FileType::Program), Message::LoadProgram)
+                Task::perform(pick_file(FileType::Program), Message::LoadProgram)
             }
             Message::LoadProgram(Ok(path)) => {
                 self.settings.program_path = Some(path.to_path_buf());
-                Command::none()
+                let program_path = self.settings.program_path.as_deref();
+                if let Some(path) = program_path {
+                    self.programs.program_bytes =
+                        get_program_bytes(path.to_str().expect("A valid path is expected"))
+                            .unwrap_or(Vec::new())
+                }
+                Task::none()
             }
             Message::LoadProgram(Err(err)) => {
                 self.error = Some(err);
-                Command::none()
+                Task::perform(Blich::clear_error(), |_| Message::ErrorCleared)
             }
             Message::DeployProgram => {
-                self.programs.transactions = (0, 0);
-                let (progress_sender, progress_receiver) = mpsc::channel::<(usize, usize)>(10000);
-                self.programs.receiver_data_channel = Arc::new(Mutex::new(Some(progress_receiver)));
                 self.programs.is_deploying = true;
-                Command::perform(
-                    BPrograms::create_buffer_and_write_data(
-                        self.programs.clone(),
-                        self.settings.clone(),
-                        progress_sender,
-                    ),
-                    Message::ProgramDeployed,
-                )
-            }
-            Message::ProgramDeployed(Ok(buffer)) => {
-                println!("Deployed!");
-                self.programs.buffer_account = buffer;
-                self.programs.is_deployed = true;
-                self.programs.is_deploying = false;
-                Command::none()
-            }
-            Message::ProgramDeployed(Err(e)) => {
-                self.error = Some(e);
-                Command::none()
+                self.programs.transactions = (0, 0);
+                Task::none()
             }
             Message::UpdateProgress(progress) => {
                 match progress {
-                    Progress::Sending { sent, total } => {
-                        self.programs.is_deployed = false;
+                    Ok(Progress::Sending { sent, total }) => {
                         self.programs.transactions = (sent, total);
                     }
-                    Progress::Completed => {
+                    Ok(Progress::Completed { buffer_account }) => {
+                        println!("Deployed!");
+                        self.programs.transactions = (0, 0);
+                        self.programs.buffer_account = buffer_account;
                         self.programs.is_deployed = true;
-                        self.programs.receiver_data_channel = Arc::new(Mutex::new(None));
+                        self.programs.is_deploying = false;
+                        return Task::perform(
+                            keypair_balance(
+                                self.settings
+                                    .keypair_path
+                                    .clone()
+                                    .unwrap_or(default_keypair_path()),
+                                self.settings.rpc_client.clone(),
+                            ),
+                            Message::AuthoritySolBalance,
+                        );
                     }
-                    Progress::Idle => {
+                    Ok(Progress::Idle) => {
                         println!("Starting")
                     }
+                    Err(e) => {
+                        self.error = Some(e);
+                        return Task::perform(Blich::clear_error(), |_| Message::ErrorCleared);
+                    }
                 }
-                Command::none()
+                Task::none()
             }
             Message::RpcClient(rpc_client) => {
                 self.settings.rpc_client = Arc::new(RpcClient::new(rpc_client));
-                Command::none()
+                Task::none()
+            }
+            Message::CopyToCliboard(value_to_copy) => clipboard::write(value_to_copy.to_string()),
+            Message::ErrorCleared => {
+                self.error = None;
+                Task::none()
             }
         }
     }
 
-    fn subscription(&self) -> Subscription<Self::Message> {
+    fn subscription(&self) -> Subscription<Message> {
         match self.programs.is_deploying {
-            true => {
-                let progress_receiver = Arc::clone(&self.programs.receiver_data_channel);
-                progress_subscription(progress_receiver).map(Message::UpdateProgress)
-            }
+            true => Progress::run_susbcription(1, self.programs.clone(), self.settings.clone())
+                .map(|values| Message::UpdateProgress(values.1)),
             false => Subscription::none(),
         }
     }
 
-    fn view(&self) -> Element<'_, Self::Message, Renderer<Self::Theme>> {
+    fn view(&self) -> Element<Message> {
         let settings = self.settings.view();
-        let is_deployed = self.programs.view();
-        let buffer_acc = buffer_address(&self.programs.buffer_account.clone().pubkey().to_string());
+        let is_deployed = self.programs.deployed_message_element();
+        let program_size = self.programs.program_size_element();
+        let buffer_acc = self.programs.buffer_address();
         let display_error = error(&self.error);
         let tx_progress = tx_progress(self.programs.transactions.0, self.programs.transactions.1);
-        let deploy_program_btn = deploy_program_btn();
+        let write_data_btn = self.programs.write_data_btn();
 
         container(
             column![
                 settings,
+                program_size,
                 buffer_acc,
-                deploy_program_btn,
+                write_data_btn,
                 tx_progress,
                 display_error,
                 is_deployed
@@ -180,10 +196,14 @@ impl Application for Blich {
     }
 
     fn title(&self) -> String {
-        String::from("Blich Deployer Application")
+        String::from("Program Deployer")
     }
 
     fn theme(&self) -> Theme {
-        Theme::Dark
+        Theme::Dracula
+    }
+
+    pub async fn clear_error() -> () {
+        time::sleep(Duration::from_secs(5)).await;
     }
 }

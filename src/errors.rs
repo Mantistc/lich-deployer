@@ -6,13 +6,11 @@ pub enum Error {
     DialogClosed,
     FetchBalanceError,
     InvalidFileType,
-    FetchBlockhashError,
     TransactionError(TransactionError),
     RpcError(ClientError),
     InstructionError(InstructionError),
-    InvalidAmount,
-    InvalidPubKeyLen,
-    InsufficientBalance,
+    InvalidProgramLen,
+    UnexpectedError,
 }
 
 impl From<TransactionError> for Error {
@@ -33,7 +31,6 @@ impl Clone for Error {
             Error::DialogClosed => Error::DialogClosed,
             Error::FetchBalanceError => Error::FetchBalanceError,
             Error::InvalidFileType => Error::InvalidFileType,
-            Error::FetchBlockhashError => Error::FetchBlockhashError,
             Error::TransactionError(e) => Error::TransactionError(e.clone()),
             Error::InstructionError(e) => Error::InstructionError(e.clone()),
             Error::RpcError(e) => Error::RpcError(ClientError {
@@ -42,9 +39,8 @@ impl Clone for Error {
                     e.to_string(),
                 )),
             }),
-            Error::InvalidAmount => Error::InvalidAmount,
-            Error::InvalidPubKeyLen => Error::InvalidPubKeyLen,
-            Error::InsufficientBalance => Error::InsufficientBalance,
+            Error::InvalidProgramLen => Error::InvalidProgramLen,
+            Error::UnexpectedError => Error::UnexpectedError,
         }
     }
 }
