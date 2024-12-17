@@ -11,6 +11,7 @@ pub enum Error {
     InstructionError(InstructionError),
     InvalidProgramLen,
     UnexpectedError,
+    ProgramAccountNotLoaded
 }
 
 impl From<TransactionError> for Error {
@@ -41,6 +42,7 @@ impl Clone for Error {
             }),
             Error::InvalidProgramLen => Error::InvalidProgramLen,
             Error::UnexpectedError => Error::UnexpectedError,
+            Error::ProgramAccountNotLoaded => Error::ProgramAccountNotLoaded,
         }
     }
 }

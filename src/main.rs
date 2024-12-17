@@ -1,4 +1,4 @@
-use components::{error, tx_progress};
+use components::error;
 use iced::{
     clipboard,
     widget::{column, container},
@@ -7,6 +7,7 @@ use iced::{
 use programs::{get_program_bytes, BPrograms, Progress};
 use settings::{keypair_balance, BSettings};
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::signature::Signature;
 use std::sync::Arc;
 use std::{path::PathBuf, time::Duration};
 use tokio::time;
@@ -49,15 +50,19 @@ impl Default for Blich {
 #[derive(Debug, Clone)]
 enum Message {
     PickProgramAuthority,
+    PickProgramAccount,
+    LoadProgramAccount(Result<PathBuf, Error>),
     LoadProgramAuthority(Result<PathBuf, Error>),
     AuthoritySolBalance(Result<u64, Error>),
     PickProgram,
     LoadProgram(Result<PathBuf, Error>),
-    DeployProgram,
+    WriteData,
     RpcClient(String),
     UpdateProgress(Result<Progress, Error>),
     CopyToCliboard(String),
     ErrorCleared,
+    DeployProgram,
+    DeployedProgramSignature(Result<Signature, Error>),
 }
 
 impl Blich {
@@ -88,6 +93,17 @@ impl Blich {
                 self.error = Some(err);
                 Task::perform(Blich::clear_error(), |_| Message::ErrorCleared)
             }
+            Message::PickProgramAccount => {
+                Task::perform(pick_file(FileType::Keypair), Message::LoadProgramAccount)
+            }
+            Message::LoadProgramAccount(Ok(path_buf)) => {
+                self.programs.program_account = Some(load_keypair_from_file(path_buf).into());
+                Task::none()
+            }
+            Message::LoadProgramAccount(Err(err)) => {
+                self.error = Some(err);
+                Task::perform(Blich::clear_error(), |_| Message::ErrorCleared)
+            }
             Message::AuthoritySolBalance(Ok(balance)) => {
                 self.settings.balance = Some(balance);
                 Task::none()
@@ -113,8 +129,10 @@ impl Blich {
                 self.error = Some(err);
                 Task::perform(Blich::clear_error(), |_| Message::ErrorCleared)
             }
-            Message::DeployProgram => {
-                self.programs.is_deploying = true;
+            Message::WriteData => {
+                self.programs.signature = None;
+                self.programs.is_writing_data = true;
+                self.programs.is_data_writed = false;
                 self.programs.transactions = (0, 0);
                 Task::none()
             }
@@ -124,11 +142,11 @@ impl Blich {
                         self.programs.transactions = (sent, total);
                     }
                     Ok(Progress::Completed { buffer_account }) => {
-                        println!("Deployed!");
+                        println!("Data Writed!");
                         self.programs.transactions = (0, 0);
                         self.programs.buffer_account = buffer_account;
-                        self.programs.is_deployed = true;
-                        self.programs.is_deploying = false;
+                        self.programs.is_data_writed = true;
+                        self.programs.is_writing_data = false;
                         return Task::perform(
                             keypair_balance(
                                 self.settings
@@ -145,10 +163,34 @@ impl Blich {
                     }
                     Err(e) => {
                         self.error = Some(e);
+                        self.programs.transactions = (0, 0);
+                        self.programs.is_data_writed = false;
+                        self.programs.is_writing_data = false;
                         return Task::perform(Blich::clear_error(), |_| Message::ErrorCleared);
                     }
                 }
                 Task::none()
+            }
+            Message::DeployProgram => Task::perform(
+                BPrograms::deploy_or_upgrade(self.programs.clone(), self.settings.clone()),
+                Message::DeployedProgramSignature,
+            ),
+            Message::DeployedProgramSignature(Ok(signature)) => {
+                self.programs.signature = Some(signature);
+                Task::perform(
+                    keypair_balance(
+                        self.settings
+                            .keypair_path
+                            .clone()
+                            .unwrap_or(default_keypair_path()),
+                        self.settings.rpc_client.clone(),
+                    ),
+                    Message::AuthoritySolBalance,
+                )
+            }
+            Message::DeployedProgramSignature(Err(err)) => {
+                self.error = Some(err);
+                Task::perform(Blich::clear_error(), |_| Message::ErrorCleared)
             }
             Message::RpcClient(rpc_client) => {
                 self.settings.rpc_client = Arc::new(RpcClient::new(rpc_client));
@@ -163,7 +205,7 @@ impl Blich {
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        match self.programs.is_deploying {
+        match self.programs.is_writing_data {
             true => Progress::run_susbcription(1, self.programs.clone(), self.settings.clone())
                 .map(|values| Message::UpdateProgress(values.1)),
             false => Subscription::none(),
@@ -171,25 +213,27 @@ impl Blich {
     }
 
     fn view(&self) -> Element<Message> {
-        let settings = self.settings.view();
-        let is_deployed = self.programs.deployed_message_element();
-        let program_size = self.programs.program_size_element();
+        let settings = self.settings.view(&self.programs);
+        let is_data_writed = self.programs.deployed_message_element();
+        let deploy_btn = self.programs.deploy_or_upgrade_btn();
         let buffer_acc = self.programs.buffer_address();
         let display_error = error(&self.error);
-        let tx_progress = tx_progress(self.programs.transactions.0, self.programs.transactions.1);
+        let tx_progress = self.programs.tx_progress();
         let write_data_btn = self.programs.write_data_btn();
+        let signature = self.programs.signature_text_with_copy();
 
         container(
             column![
                 settings,
-                program_size,
                 buffer_acc,
-                write_data_btn,
                 tx_progress,
+                write_data_btn,
                 display_error,
-                is_deployed
+                is_data_writed,
+                deploy_btn,
+                signature
             ]
-            .spacing(14),
+            .spacing(5),
         )
         .padding(30)
         .into()

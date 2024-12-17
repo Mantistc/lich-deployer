@@ -11,7 +11,7 @@ use iced::{
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{native_token::LAMPORTS_PER_SOL, signature::Keypair, signer::Signer};
 
-use crate::{components::copy_to_cliboard_btn, errors::Error};
+use crate::{components::copy_to_cliboard_btn, errors::Error, programs::BPrograms};
 use crate::{files::default_keypair_path, keypair::load_keypair_from_file, Message};
 
 const RPC_URL: &str = "https://api.devnet.solana.com";
@@ -39,7 +39,7 @@ impl Default for BSettings {
 }
 
 impl BSettings {
-    pub fn view(&self) -> Element<'static, Message> {
+    pub fn view(&self, program_module: &BPrograms) -> Element<'static, Message> {
         let keypair_path = self
             .keypair_path
             .as_deref()
@@ -47,7 +47,6 @@ impl BSettings {
             .unwrap_or_else(|| PathBuf::from(""));
 
         let load_keypair = button("Load Keypair").on_press(Message::PickProgramAuthority);
-        let load_program = button("Load Program Binaries").on_press(Message::PickProgram);
 
         let keypair = load_keypair_from_file(keypair_path);
 
@@ -70,7 +69,8 @@ impl BSettings {
             None => column![text("Loading balance...").size(14)],
         };
 
-        let row_wallet_balance = column![pubkey_container, balance_text].spacing(15);
+        let column_wallet_balance =
+            column![pubkey_container, balance_text, load_keypair].spacing(5);
 
         let rpc_label = text(format!("RPC Client URL: ",))
             .size(14)
@@ -81,11 +81,53 @@ impl BSettings {
             .on_input(Message::RpcClient);
 
         let set_rpc_client = column![rpc_label, rpc_input];
-        let btns = row![load_keypair, load_program].spacing(10);
 
-        container(column![btns, row_wallet_balance, set_rpc_client,].spacing(10))
-            .align_x(iced::alignment::Horizontal::Center)
-            .into()
+        let load_program = button("Load Program .so").on_press(Message::PickProgram);
+
+        let program_address = program_module
+            .program_account
+            .as_ref()
+            .map_or(String::from("Undefined program account..."), |v| {
+                v.pubkey().to_string()
+            });
+
+        let program_label = text(format!("Program pubkey: ",))
+            .size(14)
+            .color(color!(0x30cbf2));
+
+        let copy_btn = copy_to_cliboard_btn(&program_address);
+        let program_text = text(program_address).size(14);
+        let program_address_with_copy_btn_row =
+            row![program_text, copy_btn].spacing(5).align_y(iced::Alignment::Center);
+
+        let load_program_account =
+            button("Load Program Account").on_press(Message::PickProgramAccount);
+
+        let program_account_column = column![
+            program_label,
+            program_address_with_copy_btn_row,
+            load_program_account
+        ]
+        .spacing(5);
+
+        let program_binaries_column = column![
+            text("Program size: ").color(color!(0x30cbf2)).size(14),
+            text(format!("{} bytes", program_module.program_bytes.len())).size(14),
+            load_program
+        ]
+        .spacing(5);
+
+        container(
+            column![
+                column_wallet_balance,
+                set_rpc_client,
+                program_account_column,
+                program_binaries_column
+            ]
+            .spacing(10),
+        )
+        .align_x(iced::alignment::Horizontal::Center)
+        .into()
     }
 }
 

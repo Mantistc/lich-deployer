@@ -3,7 +3,7 @@ use solana_sdk::{
         create_buffer, deploy_with_max_program_len, set_buffer_authority, upgrade, write,
     },
     hash::Hash,
-    instruction::{Instruction, InstructionError},
+    instruction::InstructionError,
     pubkey::Pubkey,
     signature::Keypair,
     signer::Signer,
@@ -70,13 +70,14 @@ pub fn _set_new_buffer_auth(
 }
 
 // TODO: implements deploy instructions
-pub fn _deploy_program(
-    authority: Keypair,
-    program_keypair: Keypair,
+pub fn deploy_program(
+    authority: &Keypair,
+    program_keypair: &Keypair,
     buffer_address: &Pubkey,
     program_bytes: &Vec<u8>,
     program_lamports: u64,
-) -> Result<Vec<Instruction>, InstructionError> {
+    recent_blockhash: Hash,
+) -> Result<Transaction, InstructionError> {
     let payer_address = &authority.pubkey();
     let program_address = &program_keypair.pubkey();
     let len = program_bytes.len();
@@ -88,23 +89,29 @@ pub fn _deploy_program(
         payer_address,
         program_lamports,
         len,
-    );
-    deploy_program
+    )?;
+
+    let mut tx = Transaction::new_with_payer(&deploy_program, Some(&authority.pubkey()));
+    tx.sign(&[&authority, &program_keypair], recent_blockhash);
+    Ok(tx)
 }
 
 // TODO: implements upgrade program instructions
-pub fn _upgrade_program(
-    program_keypair: Keypair,
+pub fn upgrade_program(
+    program_keypair: &Keypair,
     buffer_address: &Pubkey,
-    authority: Keypair,
-) -> Instruction {
+    authority: &Keypair,
+    recent_blockhash: Hash,
+) -> Transaction {
     let authority_pubkey = &authority.pubkey();
     let program_address = &program_keypair.pubkey();
-    let upgrade_program = upgrade(
+    let upgrade_program_ix = upgrade(
         program_address,
         buffer_address,
         authority_pubkey,
         authority_pubkey,
     );
-    upgrade_program
+    let mut tx = Transaction::new_with_payer(&[upgrade_program_ix], Some(&authority.pubkey()));
+    tx.sign(&[&authority], recent_blockhash);
+    tx
 }
