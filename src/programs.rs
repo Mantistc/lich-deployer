@@ -81,6 +81,10 @@ impl BPrograms {
             .await
             .unwrap_or(0);
 
+        if lamports >= settings.balance.unwrap_or(0) {
+            return Err(Error::FetchBalanceError);
+        }
+
         if self.program_bytes.len() == 0 {
             println!("error");
             return Err(Error::InvalidProgramLen);
@@ -98,7 +102,7 @@ impl BPrograms {
         let _signature =
             send_tx_and_verify_status(&rpc_client, &buffer_acc_init_tx, SEND_CFG).await;
 
-        let (updated_blockhash, _) = rpc_client
+        let (updated_blockhash, mut last_valid_blockheight) = rpc_client
             .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
             .await
             .map_err(|e| Error::RpcError(e))?;
@@ -110,7 +114,7 @@ impl BPrograms {
             updated_blockhash,
         );
 
-        let sleep_between_send = 25; // 15 ms to await between each send
+        let sleep_between_send = 15; // 15 ms to await between each send
         let batch_size = 250;
 
         let mut tx_sent = 0;
@@ -130,12 +134,11 @@ impl BPrograms {
                 time::sleep(Duration::from_millis(sleep_between_send)).await;
             }
 
-            time::sleep(Duration::from_secs(5)).await;
-
             let tx_signatures: Vec<Signature> = write_data_txs
                 .iter()
                 .map(|tx| *tx.get_signature())
                 .collect();
+
             let mut tx_signatures_batches = get_vec_with_batched_data(batch_size, &tx_signatures);
 
             let check_failed_tx_tasks: Vec<JoinHandle<Vec<Signature>>> = tx_signatures_batches
@@ -200,13 +203,19 @@ impl BPrograms {
                 .filter(|tx| tx_to_retry.contains(tx.get_signature()))
                 .collect();
 
-            let (updated_blockhash, _) = rpc_client
-                .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
-                .await
-                .map_err(|e| Error::RpcError(e))?;
+            let current_blockheight = rpc_client.get_block_height().await.unwrap_or_default();
 
-            for transaction in write_data_txs.iter_mut() {
-                transaction.sign(&[&authority], updated_blockhash);
+            if current_blockheight >= last_valid_blockheight {
+                let (updated_blockhash, last_valid_block_height_updated) = rpc_client
+                    .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+                    .await
+                    .map_err(|e| Error::RpcError(e))?;
+
+                last_valid_blockheight = last_valid_block_height_updated;
+
+                for transaction in write_data_txs.iter_mut() {
+                    transaction.sign(&[&authority], updated_blockhash);
+                }
             }
 
             if tx_to_retry.is_empty() {
@@ -388,8 +397,8 @@ impl Progress {
     ) -> impl Stream<Item = Result<Progress, Error>> {
         try_channel(1500, move |output| async move {
             let result = BPrograms::create_buffer_and_write_data(programs, settings, output).await;
-            if let Err(_e) = result {
-                return Err(Error::UnexpectedError);
+            if let Err(e) = result {
+                return Err(e);
             } else {
                 Ok(())
             }
