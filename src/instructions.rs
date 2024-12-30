@@ -1,16 +1,24 @@
+use bincode::serialized_size;
 use solana_sdk::{
     bpf_loader_upgradeable::{
         create_buffer, deploy_with_max_program_len, set_buffer_authority, upgrade, write,
     },
+    compute_budget::ComputeBudgetInstruction,
     hash::Hash,
-    instruction::InstructionError,
+    instruction::{Instruction, InstructionError},
     pubkey::Pubkey,
     signature::Keypair,
     signer::Signer,
     transaction::Transaction,
 };
 
-use crate::programs::{get_vec_with_batched_data, BYTES_PER_CHUNK};
+use crate::{programs::get_vec_with_batched_data, settings::LSettings};
+
+pub fn get_priority_fees_ixs(unit_limit: u32, unit_price: u64) -> [Instruction; 2] {
+    let comput_unit_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(unit_limit);
+    let comput_unit_price_ix = ComputeBudgetInstruction::set_compute_unit_price(unit_price);
+    [comput_unit_limit_ix, comput_unit_price_ix]
+}
 
 pub fn create_buffer_account(
     buffer_account: &Keypair,
@@ -18,15 +26,18 @@ pub fn create_buffer_account(
     lamports: u64,
     program_bytes: &Vec<u8>,
     recent_blockhash: Hash,
+    settings: &LSettings,
 ) -> Result<Transaction, InstructionError> {
     println!("lamports: {}, bytes: {:?}", lamports, program_bytes.len());
-    let create_buffer_ix = create_buffer(
+    let mut create_buffer_ix = create_buffer(
         &authority.pubkey(),
         &buffer_account.pubkey(),
         &authority.pubkey(),
         lamports,
         program_bytes.len(),
     )?;
+    let priority_ixs = get_priority_fees_ixs(settings.unit_limit, settings.unit_price);
+    create_buffer_ix.splice(0..0, priority_ixs);
     let mut tx = Transaction::new_with_payer(&create_buffer_ix, Some(&authority.pubkey()));
     tx.sign(&[&authority, &buffer_account], recent_blockhash);
 
@@ -38,26 +49,36 @@ pub fn write_data(
     program_bytes: &Vec<u8>,
     authority: &Keypair,
     recent_blockhash: Hash,
+    bytes_per_chunk: usize,
+    settings: &LSettings,
 ) -> Vec<Transaction> {
     let mut transactions = Vec::new();
-    let write_data_batches = get_vec_with_batched_data(BYTES_PER_CHUNK, program_bytes);
+    let write_data_batches = get_vec_with_batched_data(bytes_per_chunk, program_bytes);
+    let priority_ixs = get_priority_fees_ixs(settings.unit_limit, settings.unit_price);
     for (index, data) in write_data_batches.into_iter().enumerate() {
+        let mut ixs = Vec::new();
         let write_ix = write(
             &buffer_address,
             &authority.pubkey(),
-            index as u32 * BYTES_PER_CHUNK as u32,
+            index as u32 * bytes_per_chunk as u32,
             data,
         );
-        let mut tx = Transaction::new_with_payer(&[write_ix], Some(&authority.pubkey()));
+
+        ixs.extend_from_slice(&priority_ixs);
+        ixs.push(write_ix.clone());
+        let mut tx = Transaction::new_with_payer(&ixs, Some(&authority.pubkey()));
         tx.sign(&[&authority], recent_blockhash);
+        let size =serialized_size(&tx).unwrap() as usize;
+        let ix_write_size =serialized_size(&write_ix).unwrap() as usize;
+        println!("tx size: {}, tx_chunk: {}, write_ix_size: {}", size, bytes_per_chunk, ix_write_size);
         transactions.push(tx)
     }
     transactions
 }
 
 // TODO: implements set a new buffer authority
-// this works if you want to set your Squad as authority
-pub fn _set_new_buffer_auth(
+// this will be useful if you want to use your squad authority to upgrade a program using this buffer account
+pub fn set_new_buffer_auth(
     buffer_address: &Pubkey,
     authority: &Keypair,
     recent_blockhash: Hash,
@@ -69,7 +90,6 @@ pub fn _set_new_buffer_auth(
     tx
 }
 
-// TODO: implements deploy instructions
 pub fn deploy_program(
     authority: &Keypair,
     program_keypair: &Keypair,
@@ -96,7 +116,6 @@ pub fn deploy_program(
     Ok(tx)
 }
 
-// TODO: implements upgrade program instructions
 pub fn upgrade_program(
     program_keypair: &Keypair,
     buffer_address: &Pubkey,

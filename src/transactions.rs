@@ -7,7 +7,7 @@ use tokio::time;
 
 use crate::errors::Error;
 
-// this send the tx and verify if the confirmation status at least reach processed
+// this send the tx and verify its confimation
 // if there's any error on the tx status, the loop will break.
 pub async fn send_tx_and_verify_status(
     rpc_client: &RpcClient,
@@ -35,7 +35,7 @@ pub async fn send_tx_and_verify_status(
                 solana_transaction_status::TransactionConfirmationStatus::Processed => continue,
                 solana_transaction_status::TransactionConfirmationStatus::Confirmed
                 | solana_transaction_status::TransactionConfirmationStatus::Finalized => break,
-                _ => return Err(Error::FetchBalanceError),
+                _ => return Err(Error::TransactionConfirmationStatusFailed),
             };
         }
         time::sleep(Duration::from_millis(500)).await
