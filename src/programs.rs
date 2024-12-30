@@ -2,9 +2,10 @@ use iced::futures::channel::mpsc::Sender;
 use iced::futures::future::join_all;
 use iced::futures::{Stream, StreamExt};
 use iced::stream::try_channel;
-use iced::widget::{button, column, progress_bar, row, text};
+use iced::widget::{button, column, progress_bar, row, text, text_input};
 use iced::{color, Alignment, Element, Subscription};
 use solana_client::{rpc_client::SerializableTransaction, rpc_config::RpcSendTransactionConfig};
+use solana_sdk::pubkey::Pubkey;
 use solana_sdk::transaction::Transaction;
 use solana_sdk::{
     commitment_config::{CommitmentConfig, CommitmentLevel},
@@ -12,22 +13,24 @@ use solana_sdk::{
     signer::Signer,
 };
 use solana_transaction_status::UiTransactionEncoding;
-use std::hash::Hash;
+use std::str::FromStr;
 use std::{fs, sync::Arc, time::Duration};
 use tokio::task::JoinHandle;
 use tokio::{spawn, time};
 
 use crate::components::copy_to_cliboard_btn;
-use crate::instructions::{create_buffer_account, deploy_program, upgrade_program, write_data};
-use crate::settings::BSettings;
+use crate::instructions::{
+    create_buffer_account, deploy_program, set_new_buffer_auth, upgrade_program, write_data,
+};
+use crate::settings::LSettings;
 use crate::transactions::send_tx_and_verify_status;
 use crate::{errors::Error, Message};
 
-pub const BYTES_PER_CHUNK: usize = 1012;
+pub const MAX_WRITE_LEN: usize = 960;
 pub const PROGRAM_EXTRA_SPACE: usize = 45;
 
 #[derive(Debug, Clone)]
-pub struct BPrograms {
+pub struct LPrograms {
     pub buffer_account: Arc<Keypair>,
     pub program_account: Option<Arc<Keypair>>,
     pub program_bytes: Vec<u8>,
@@ -35,9 +38,10 @@ pub struct BPrograms {
     pub is_data_writed: bool,
     pub is_writing_data: bool,
     pub signature: Option<Signature>,
+    pub new_buffer_authority: Option<String>,
 }
 
-impl Default for BPrograms {
+impl Default for LPrograms {
     fn default() -> Self {
         Self {
             buffer_account: Keypair::new().into(),
@@ -47,6 +51,7 @@ impl Default for BPrograms {
             is_data_writed: false,
             is_writing_data: false,
             signature: None,
+            new_buffer_authority: None,
         }
     }
 }
@@ -59,10 +64,10 @@ pub const SEND_CFG: RpcSendTransactionConfig = RpcSendTransactionConfig {
     min_context_slot: None,
 };
 
-impl BPrograms {
+impl LPrograms {
     pub async fn create_buffer_and_write_data(
         self,
-        settings: BSettings,
+        settings: LSettings,
         mut output: Sender<Progress>,
     ) -> Result<(), Error> {
         let _ = output.try_send(Progress::Idle);
@@ -82,7 +87,7 @@ impl BPrograms {
             .unwrap_or(0);
 
         if lamports >= settings.balance.unwrap_or(0) {
-            return Err(Error::FetchBalanceError);
+            return Err(Error::InsufficientSolBalance);
         }
 
         if self.program_bytes.len() == 0 {
@@ -96,6 +101,7 @@ impl BPrograms {
             lamports,
             &self.program_bytes,
             recent_blockhash,
+            &settings,
         )
         .map_err(|e| Error::InstructionError(e))?;
 
@@ -106,12 +112,13 @@ impl BPrograms {
             .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
             .await
             .map_err(|e| Error::RpcError(e))?;
-
         let mut write_data_txs = write_data(
             &buffer_acc.pubkey(),
             &self.program_bytes,
             &authority,
             updated_blockhash,
+            MAX_WRITE_LEN,
+            &settings,
         );
 
         let sleep_between_send = 15; // 15 ms to await between each send
@@ -182,7 +189,7 @@ impl BPrograms {
                                 break;
                             }
 
-                            time::sleep(Duration::from_millis(200)).await;
+                            time::sleep(Duration::from_millis(500)).await;
                             retrys += 1;
                         }
                         tx_to_retry
@@ -230,9 +237,9 @@ impl BPrograms {
         Ok(())
     }
 
-    pub async fn deploy_or_upgrade(self, settings: BSettings) -> Result<Signature, Error> {
-        // first check if the program account is initialized
+    pub async fn deploy_or_upgrade(self, settings: LSettings) -> Result<Signature, Error> {
         let rpc_client = &settings.rpc_client;
+        // first check if the program account is set
         let program_account = if let Some(valid_program_acc) = &self.program_account {
             valid_program_acc
         } else {
@@ -283,11 +290,29 @@ impl BPrograms {
         Ok(signature)
     }
 
+    pub async fn set_new_buffer_authority(self, settings: LSettings) -> Result<Signature, Error> {
+        let rpc_client = &settings.rpc_client;
+        let buffer_address = self.buffer_account.pubkey();
+        let authority = &settings.keypair;
+        let (recent_blockhash, _) = rpc_client
+            .get_latest_blockhash_with_commitment(CommitmentConfig::confirmed())
+            .await
+            .map_err(|e| Error::RpcError(e))?;
+        let new_authority = if let Some(new_authority) = &self.new_buffer_authority {
+            Pubkey::from_str(new_authority).map_err(|_| Error::UndefinedNewBufferAuthority)?
+        } else {
+            return Err(Error::UndefinedNewBufferAuthority);
+        };
+        let tx = set_new_buffer_auth(&buffer_address, authority, recent_blockhash, &new_authority);
+        let signature = send_tx_and_verify_status(&rpc_client, &tx, SEND_CFG).await?;
+        Ok(signature)
+    }
+
     // ------> UI COMPONENTS <------ //
 
     pub fn deployed_message_element(&self) -> Element<Message> {
         let is_data_writed = if self.is_data_writed {
-            text("Data writed successfully").size(14)
+            text("Data written successfully").size(14)
         } else {
             text("").size(14)
         };
@@ -333,7 +358,39 @@ impl BPrograms {
             deploy.into()
         } else {
             let deploy =
-                text("To be able to deploy, the buffer account needs the data writed").size(14);
+                text("To deploy, the buffer account must have the data written to it.").size(14);
+            deploy.into()
+        }
+    }
+
+    pub fn set_new_buffer_auth_items(&self) -> Element<Message> {
+        if self.is_data_writed {
+            let new_buffer_auth_input_label = text(format!("New Buffer Authority: ",))
+                .size(14)
+                .color(color!(0x30cbf2));
+
+            let new_buffer_auth_value = &self
+                .new_buffer_authority
+                .clone()
+                .unwrap_or(String::new())
+                .to_string();
+
+            let new_buffer_auth_input = text_input("", new_buffer_auth_value)
+                .size(14)
+                .on_input(Message::SetNewBufferAuthInput);
+
+            let set_new_auth_btn =
+                button("Set New Buffer Authority").on_press(Message::SetNewBufferAuth);
+
+            let comput_limit_column = column![
+                new_buffer_auth_input_label,
+                new_buffer_auth_input,
+                set_new_auth_btn
+            ]
+            .spacing(5);
+            comput_limit_column.into()
+        } else {
+            let deploy = text("").size(14);
             deploy.into()
         }
     }
@@ -392,11 +449,11 @@ pub enum Progress {
 
 impl Progress {
     pub fn sending_tx_progress_sub(
-        programs: BPrograms,
-        settings: BSettings,
+        programs: LPrograms,
+        settings: LSettings,
     ) -> impl Stream<Item = Result<Progress, Error>> {
         try_channel(1500, move |output| async move {
-            let result = BPrograms::create_buffer_and_write_data(programs, settings, output).await;
+            let result = LPrograms::create_buffer_and_write_data(programs, settings, output).await;
             if let Err(e) = result {
                 return Err(e);
             } else {
@@ -405,10 +462,10 @@ impl Progress {
         })
     }
 
-    pub fn run_susbcription<I: 'static + Hash + Copy + Send + Sync>(
+    pub fn run_susbcription<I: 'static + std::hash::Hash + Copy + Send + Sync>(
         id: I,
-        programs: BPrograms,
-        settings: BSettings,
+        programs: LPrograms,
+        settings: LSettings,
     ) -> iced::Subscription<(I, Result<Progress, Error>)> {
         Subscription::run_with_id(
             id,

@@ -4,8 +4,8 @@ use iced::{
     widget::{column, container},
     Element, Subscription, Task, Theme,
 };
-use programs::{get_program_bytes, BPrograms, Progress};
-use settings::{keypair_balance, BSettings};
+use programs::{get_program_bytes, LPrograms, Progress};
+use settings::{keypair_balance, LSettings};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::signature::Signature;
 use std::sync::Arc;
@@ -25,23 +25,23 @@ use files::{default_keypair_path, pick_file, FileType};
 use keypair::load_keypair_from_file;
 
 fn main() -> iced::Result {
-    iced::application(Blich::title, Blich::update, Blich::view)
-        .theme(Blich::theme)
-        .subscription(Blich::subscription)
-        .run_with(Blich::new)
+    iced::application(Lich::title, Lich::update, Lich::view)
+        .theme(Lich::theme)
+        .subscription(Lich::subscription)
+        .run_with(Lich::new)
 }
 
-struct Blich {
-    pub settings: BSettings,
-    pub programs: BPrograms,
+struct Lich {
+    pub settings: LSettings,
+    pub programs: LPrograms,
     pub error: Option<Error>,
 }
 
-impl Default for Blich {
+impl Default for Lich {
     fn default() -> Self {
         Self {
-            settings: BSettings::default(),
-            programs: BPrograms::default(),
+            settings: LSettings::default(),
+            programs: LPrograms::default(),
             error: None,
         }
     }
@@ -58,17 +58,21 @@ enum Message {
     LoadProgram(Result<PathBuf, Error>),
     WriteData,
     RpcClient(String),
+    ComputeUnitPrice(String),
+    ComputeUniteLimit(String),
     UpdateProgress(Result<Progress, Error>),
     CopyToCliboard(String),
     ErrorCleared,
     DeployProgram,
-    DeployedProgramSignature(Result<Signature, Error>),
+    SignatureToDisplay(Result<Signature, Error>),
+    SetNewBufferAuth,
+    SetNewBufferAuthInput(String)
 }
 
-impl Blich {
+impl Lich {
     fn new() -> (Self, Task<Message>) {
         (
-            Blich::default(),
+            Lich::default(),
             Task::perform(
                 async { Ok(default_keypair_path()) },
                 Message::LoadProgramAuthority,
@@ -91,7 +95,7 @@ impl Blich {
             }
             Message::LoadProgramAuthority(Err(err)) => {
                 self.error = Some(err);
-                Task::perform(Blich::clear_error(), |_| Message::ErrorCleared)
+                Task::perform(Lich::sleep(), |_| Message::ErrorCleared)
             }
             Message::PickProgramAccount => {
                 Task::perform(pick_file(FileType::Keypair), Message::LoadProgramAccount)
@@ -102,7 +106,7 @@ impl Blich {
             }
             Message::LoadProgramAccount(Err(err)) => {
                 self.error = Some(err);
-                Task::perform(Blich::clear_error(), |_| Message::ErrorCleared)
+                Task::perform(Lich::sleep(), |_| Message::ErrorCleared)
             }
             Message::AuthoritySolBalance(Ok(balance)) => {
                 self.settings.balance = Some(balance);
@@ -110,7 +114,7 @@ impl Blich {
             }
             Message::AuthoritySolBalance(Err(e)) => {
                 self.error = Some(e);
-                Task::perform(Blich::clear_error(), |_| Message::ErrorCleared)
+                Task::perform(Lich::sleep(), |_| Message::ErrorCleared)
             }
             Message::PickProgram => {
                 Task::perform(pick_file(FileType::Program), Message::LoadProgram)
@@ -127,7 +131,7 @@ impl Blich {
             }
             Message::LoadProgram(Err(err)) => {
                 self.error = Some(err);
-                Task::perform(Blich::clear_error(), |_| Message::ErrorCleared)
+                Task::perform(Lich::sleep(), |_| Message::ErrorCleared)
             }
             Message::WriteData => {
                 self.programs.signature = None;
@@ -142,7 +146,7 @@ impl Blich {
                         self.programs.transactions = (sent, total);
                     }
                     Ok(Progress::Completed { buffer_account }) => {
-                        println!("Data Writed!");
+                        println!("Data written!");
                         self.programs.transactions = (0, 0);
                         self.programs.buffer_account = buffer_account;
                         self.programs.is_data_writed = true;
@@ -166,16 +170,16 @@ impl Blich {
                         self.programs.transactions = (0, 0);
                         self.programs.is_data_writed = false;
                         self.programs.is_writing_data = false;
-                        return Task::perform(Blich::clear_error(), |_| Message::ErrorCleared);
+                        return Task::perform(Lich::sleep(), |_| Message::ErrorCleared);
                     }
                 }
                 Task::none()
             }
             Message::DeployProgram => Task::perform(
-                BPrograms::deploy_or_upgrade(self.programs.clone(), self.settings.clone()),
-                Message::DeployedProgramSignature,
+                LPrograms::deploy_or_upgrade(self.programs.clone(), self.settings.clone()),
+                Message::SignatureToDisplay,
             ),
-            Message::DeployedProgramSignature(Ok(signature)) => {
+            Message::SignatureToDisplay(Ok(signature)) => {
                 self.programs.signature = Some(signature);
                 Task::perform(
                     keypair_balance(
@@ -188,9 +192,9 @@ impl Blich {
                     Message::AuthoritySolBalance,
                 )
             }
-            Message::DeployedProgramSignature(Err(err)) => {
+            Message::SignatureToDisplay(Err(err)) => {
                 self.error = Some(err);
-                Task::perform(Blich::clear_error(), |_| Message::ErrorCleared)
+                Task::perform(Lich::sleep(), |_| Message::ErrorCleared)
             }
             Message::RpcClient(rpc_client) => {
                 self.settings.rpc_client = Arc::new(RpcClient::new(rpc_client));
@@ -201,6 +205,30 @@ impl Blich {
                 self.error = None;
                 Task::none()
             }
+            Message::ComputeUnitPrice(unit_price) => {
+                if let Ok(parsed_price) = unit_price.parse::<u64>() {
+                    self.settings.unit_price = parsed_price;
+                } else {
+                    self.settings.unit_price = 0;
+                };
+                Task::none()
+            }
+            Message::ComputeUniteLimit(unit_limit) => {
+                if let Ok(parsed_limit) = unit_limit.parse::<u32>() {
+                    self.settings.unit_limit = parsed_limit;
+                } else {
+                    self.settings.unit_limit = 0;
+                };
+                Task::none()
+            }
+            Message::SetNewBufferAuth => Task::perform(
+                LPrograms::set_new_buffer_authority(self.programs.clone(), self.settings.clone()),
+                Message::SignatureToDisplay,
+            ),
+            Message::SetNewBufferAuthInput(new_auth) =>{
+                self.programs.new_buffer_authority = Some(new_auth);
+                Task::none()
+            },
         }
     }
 
@@ -216,6 +244,7 @@ impl Blich {
         let settings = self.settings.view(&self.programs);
         let is_data_writed = self.programs.deployed_message_element();
         let deploy_btn = self.programs.deploy_or_upgrade_btn();
+        let set_new_auth = self.programs.set_new_buffer_auth_items();
         let buffer_acc = self.programs.buffer_address();
         let display_error = error(&self.error);
         let tx_progress = self.programs.tx_progress();
@@ -231,6 +260,7 @@ impl Blich {
                 display_error,
                 is_data_writed,
                 deploy_btn,
+                set_new_auth,
                 signature
             ]
             .spacing(5),
@@ -240,14 +270,14 @@ impl Blich {
     }
 
     fn title(&self) -> String {
-        String::from("Program Deployer")
+        String::from("Lich Program Deployer")
     }
 
     fn theme(&self) -> Theme {
         Theme::Dracula
     }
 
-    pub async fn clear_error() -> () {
+    pub async fn sleep() -> () {
         time::sleep(Duration::from_secs(5)).await;
     }
 }

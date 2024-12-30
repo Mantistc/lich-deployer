@@ -1,1 +1,1 @@
-# blich-deployer
+# lich-deployer

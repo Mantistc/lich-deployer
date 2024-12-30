@@ -11,7 +11,10 @@ pub enum Error {
     InstructionError(InstructionError),
     InvalidProgramLen,
     UnexpectedError,
-    ProgramAccountNotLoaded
+    ProgramAccountNotLoaded,
+    TransactionConfirmationStatusFailed,
+    InsufficientSolBalance,
+    UndefinedNewBufferAuthority,
 }
 
 impl From<TransactionError> for Error {
@@ -43,6 +46,11 @@ impl Clone for Error {
             Error::InvalidProgramLen => Error::InvalidProgramLen,
             Error::UnexpectedError => Error::UnexpectedError,
             Error::ProgramAccountNotLoaded => Error::ProgramAccountNotLoaded,
+            Error::TransactionConfirmationStatusFailed => {
+                Error::TransactionConfirmationStatusFailed
+            }
+            Error::InsufficientSolBalance => Error::InsufficientSolBalance,
+            Error::UndefinedNewBufferAuthority => Error::UndefinedNewBufferAuthority,
         }
     }
 }
